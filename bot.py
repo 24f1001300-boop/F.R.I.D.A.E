@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -26,6 +27,7 @@ import statistics
 import socket
 import ipaddress
 from urllib.parse import urlparse
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -58,9 +60,22 @@ FETCH_TIMEOUT = 15          # seconds for one outbound web-fetch
 MAX_FETCH_BYTES = 3_000_000 # cap on a single fetched response
 MAX_FETCH_REDIRECTS = 3
 
+# Telegram's public Bot API refuses to serve files larger than 20MB via
+# getFile (only a self-hosted Local Bot API Server lifts this, which is out
+# of scope here). We stay a little under that hard platform ceiling.
+MAX_UPLOAD_BYTES = 19_000_000
+UPLOAD_ROOT = os.environ.get("UPLOAD_ROOT", "/tmp/fridae_uploads")
+UPLOAD_EXPIRY_SECONDS = int(os.environ.get("UPLOAD_EXPIRY_SECONDS", 6 * 3600))
+DATASET_CONTEXT_TAG = "[UPLOADED_DATASET_CONTEXT]"
+
 _log_lock = threading.Lock()
 _histories: dict[int, list[dict]] = {}  # chat_id -> chat-completion messages
 _hist_lock = threading.Lock()
+
+# Uploaded-dataset state: at most one active dataset per chat. Keyed by
+# chat_id (always an int from Telegram), never by anything user-supplied.
+_uploads: dict[int, dict] = {}
+_uploads_lock = threading.Lock()
 
 # Per-chat locks: two messages from the SAME chat arriving close together must
 # be processed one after another (otherwise their LLM calls interleave and can
@@ -212,6 +227,261 @@ def profile_dataframe(df):
     }
 
 
+# ------------------------------------------------------- uploaded datasets
+#
+# An uploaded dataset is an application-managed input, not a model-supplied
+# path. The model never sees or chooses a filesystem location: it only ever
+# calls load_uploaded_dataset() with zero arguments, which resolves to
+# whatever file THIS chat currently owns. The on-disk path for a chat is
+# always UPLOAD_ROOT/chat_<int chat_id>/dataset.<fmt> — chat_id is always an
+# int from Telegram, and the Telegram-supplied file_name is used only for
+# format sniffing and display, never as part of any filesystem path. This
+# rules out path traversal / absolute-path escape by construction rather
+# than by post-hoc validation.
+
+SUPPORTED_UPLOAD_FORMATS = {
+    "csv": {".csv"},
+    "json": {".json"},
+    "jsonl": {".jsonl", ".ndjson"},
+}
+SUPPORTED_UPLOAD_MIME_TYPES = {
+    "text/csv": "csv", "application/csv": "csv",
+    "application/json": "json",
+    "application/x-ndjson": "jsonl", "application/jsonlines": "jsonl", "application/jsonl": "jsonl",
+}
+
+
+def _detect_upload_format(file_name: str, mime_type: str):
+    """Return 'csv' / 'json' / 'jsonl', or None if unsupported/unrecognized."""
+    name = (file_name or "").lower()
+    for fmt, exts in SUPPORTED_UPLOAD_FORMATS.items():
+        if any(name.endswith(ext) for ext in exts):
+            return fmt
+    return SUPPORTED_UPLOAD_MIME_TYPES.get((mime_type or "").lower())
+
+
+def _chat_upload_dir(chat_id: int) -> str:
+    # int(chat_id) can never contain "/", "..", or any path-control character,
+    # so this cannot be used for traversal regardless of what a caller passes.
+    return os.path.join(UPLOAD_ROOT, f"chat_{int(chat_id)}")
+
+
+def _download_telegram_file(file_id: str, dest_path: str, max_bytes: int) -> None:
+    """Download a Telegram-hosted file (by file_id) to dest_path, capping the
+    streamed size. Raises on any failure. This only ever talks to Telegram's
+    own fixed API host (same as tg()/TG_API elsewhere in this file) — it is
+    not reachable from model-generated code and is unrelated to the SSRF
+    guardrails that protect fetch_url/fetch_csv/etc. against arbitrary
+    user-supplied URLs.
+    """
+    info = tg("getFile", file_id=file_id)
+    if not info.get("ok"):
+        raise RuntimeError(f"Telegram getFile failed: {info.get('description', 'unknown error')}")
+    file_path = (info.get("result") or {}).get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram getFile response missing file_path")
+
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    resp = requests.get(url, stream=True, timeout=60)
+    try:
+        resp.raise_for_status()
+        total = 0
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"downloaded file exceeded {max_bytes}-byte limit while streaming")
+                f.write(chunk)
+    finally:
+        resp.close()
+
+
+def _set_dataset_context_message(chat_id: int, content: str) -> None:
+    """Inject/replace the single 'current dataset' message in this chat's
+    history, so subsequent turns see the new dataset's profile instead of a
+    stale one from a previous upload."""
+    with _hist_lock:
+        history = _histories.setdefault(chat_id, [])
+        history[:] = [
+            m for m in history
+            if not (isinstance(m.get("content"), str) and m["content"].startswith(DATASET_CONTEXT_TAG))
+        ]
+        history.append({"role": "user", "content": content})
+        del history[:-20]
+
+
+def handle_document_upload(chat_id: int, document: dict) -> str:
+    """Download, validate, store, and profile an uploaded dataset for chat_id.
+    Returns a JSON reply string in the same envelope shape as solve().
+    On any failure, the previously-active dataset (if any) is left untouched.
+    """
+    file_name = document.get("file_name") or ""
+    mime_type = document.get("mime_type") or ""
+    file_id = document.get("file_id")
+    declared_size = document.get("file_size")
+
+    def fail(reason: str) -> str:
+        log_event(event="upload_rejected", chat_id=chat_id, file_name=file_name, reason=reason)
+        return json.dumps({"answer": f"upload rejected: {reason}", "log_url": LOG_URL}, ensure_ascii=False)
+
+    if not file_id:
+        return fail("missing file_id in Telegram document metadata")
+
+    fmt = _detect_upload_format(file_name, mime_type)
+    if fmt is None:
+        return fail(f"unsupported file type (name={file_name!r}, mime={mime_type!r}); supported: csv, json, jsonl")
+
+    if isinstance(declared_size, int) and declared_size > MAX_UPLOAD_BYTES:
+        return fail(f"file too large ({declared_size} bytes; limit is {MAX_UPLOAD_BYTES} bytes)")
+
+    chat_dir = _chat_upload_dir(chat_id)
+    try:
+        os.makedirs(chat_dir, exist_ok=True)
+    except OSError as e:
+        return fail(f"could not prepare storage: {e}")
+
+    # Download/parse/profile into a STAGING file first. Nothing belonging to
+    # a previously-active dataset is touched until every step below has
+    # succeeded -- a failure at any point leaves the prior dataset exactly
+    # as it was.
+    staging_path = os.path.join(chat_dir, f".staging_{uuid4().hex}.{fmt}")
+
+    log_event(event="upload_received", chat_id=chat_id, file_name=file_name,
+              mime_type=mime_type, declared_size=declared_size, format=fmt)
+
+    def _discard_staging():
+        try:
+            os.remove(staging_path)
+        except OSError:
+            pass
+
+    try:
+        _download_telegram_file(file_id, staging_path, MAX_UPLOAD_BYTES)
+    except Exception as e:
+        _discard_staging()
+        return fail(f"download failed: {e}")
+
+    try:
+        if fmt == "csv":
+            df = pd.read_csv(staging_path)
+        elif fmt == "json":
+            df = pd.read_json(staging_path)
+        else:
+            df = pd.read_json(staging_path, lines=True)
+    except Exception as e:
+        _discard_staging()
+        return fail(f"could not parse file as {fmt}: {e}")
+
+    try:
+        profile = profile_dataframe(df)
+    except Exception as e:
+        _discard_staging()
+        return fail(f"could not profile dataset: {e}")
+    finally:
+        del df  # don't hold a second full copy in memory once we have the profile
+
+    # Validation fully passed — now, and only now, replace whatever this chat
+    # had before (which may be a different format/extension) with the new
+    # file, then promote the staging file to its final name.
+    final_path = os.path.join(chat_dir, f"dataset.{fmt}")
+    for existing_name in os.listdir(chat_dir):
+        existing_path = os.path.join(chat_dir, existing_name)
+        if existing_path != staging_path:
+            try:
+                os.remove(existing_path)
+            except OSError:
+                pass
+    os.rename(staging_path, final_path)
+    dest_path = final_path
+
+    actual_size = os.path.getsize(dest_path)
+    with _uploads_lock:
+        _uploads[chat_id] = {
+            "path": dest_path,
+            "filename": file_name or f"dataset.{fmt}",
+            "format": fmt,
+            "profile": profile,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            "size_bytes": actual_size,
+        }
+
+    profile_json = json.dumps(profile, ensure_ascii=False)[:3000]
+    context_msg = (
+        f"{DATASET_CONTEXT_TAG} A dataset was uploaded to this chat "
+        f"(filename={file_name or ('dataset.' + fmt)!r}, format={fmt}, size_bytes={actual_size}). "
+        f"Profile: {profile_json}. "
+        "The file itself is on disk, not in this message. To analyze it, call run_python with "
+        "code that calls load_uploaded_dataset() (no arguments) to get it as a pandas DataFrame. "
+        "This replaces any dataset uploaded earlier in this chat."
+    )
+    _set_dataset_context_message(chat_id, context_msg)
+
+    log_event(event="upload_stored", chat_id=chat_id, file_name=file_name, format=fmt,
+              size_bytes=actual_size, rows=profile["shape"][0], columns=profile["shape"][1])
+
+    ack = {
+        "answer": (
+            f"Dataset received ({file_name or fmt}, {profile['shape'][0]} rows x "
+            f"{profile['shape'][1]} columns). Ask me anything about it."
+        ),
+        "log_url": LOG_URL,
+    }
+    return json.dumps(ack, ensure_ascii=False)
+
+
+def _make_load_uploaded_dataset(chat_id: int):
+    """Build a load_uploaded_dataset() closure bound to exactly one chat_id.
+
+    The returned function takes NO arguments — there is no parameter through
+    which model-generated code could ever supply a path. It always resolves
+    to whatever file this specific chat currently owns, or raises a clear
+    error if there isn't one.
+    """
+    def load_uploaded_dataset():
+        with _uploads_lock:
+            entry = _uploads.get(chat_id)
+        if not entry:
+            raise ValueError("no dataset has been uploaded in this chat yet")
+        path, fmt = entry["path"], entry["format"]
+        if not os.path.exists(path):
+            raise ValueError("the uploaded dataset file is no longer available (it may have expired)")
+        if fmt == "csv":
+            return pd.read_csv(path)
+        if fmt == "json":
+            return pd.read_json(path)
+        return pd.read_json(path, lines=True)
+    return load_uploaded_dataset
+
+
+def _cleanup_expired_uploads() -> None:
+    """Opportunistic sweep: delete per-chat upload directories that haven't
+    been touched in UPLOAD_EXPIRY_SECONDS, and drop the matching in-memory
+    entry so load_uploaded_dataset() fails cleanly instead of pointing at a
+    half-deleted file. Called periodically from keepwarm_loop()."""
+    if not os.path.isdir(UPLOAD_ROOT):
+        return
+    now = time.time()
+    for entry_name in os.listdir(UPLOAD_ROOT):
+        chat_dir = os.path.join(UPLOAD_ROOT, entry_name)
+        if not os.path.isdir(chat_dir):
+            continue
+        try:
+            age = now - os.path.getmtime(chat_dir)
+            if age <= UPLOAD_EXPIRY_SECONDS:
+                continue
+            shutil.rmtree(chat_dir, ignore_errors=True)
+            if entry_name.startswith("chat_"):
+                try:
+                    cid = int(entry_name[len("chat_"):])
+                    with _uploads_lock:
+                        _uploads.pop(cid, None)
+                except ValueError:
+                    pass
+            log_event(event="upload_expired", chat_dir=entry_name, age_s=round(age, 1))
+        except OSError as e:
+            log_event(event="upload_cleanup_error", chat_dir=entry_name, error=str(e))
+
+
 def _is_public_ip(ip_str: str) -> bool:
     """True only for addresses that are routable public internet addresses."""
     try:
@@ -358,12 +628,14 @@ def fetch_excel(url: str, timeout: float = FETCH_TIMEOUT, max_bytes: int = MAX_F
     return pd.read_excel(io.BytesIO(raw), **read_excel_kwargs)
 
 
-def run_python(code: str) -> str:
+def run_python(code: str, chat_id: int) -> str:
     """Validate and execute analysis code, returning captured stdout/errors.
 
     Any outcome that should trigger bounded recovery in solve() is prefixed
     with "ERROR:" or "GUARDRAIL_ERROR:" — this includes real exceptions raised
     during exec(), not just guardrail rejections and timeouts.
+
+    chat_id scopes load_uploaded_dataset() to exactly this chat's own upload.
     """
     valid, reason = validate_python(code)
     if not valid:
@@ -381,6 +653,7 @@ def run_python(code: str) -> str:
             "fetch_table": fetch_table,
             "fetch_csv": fetch_csv,
             "fetch_excel": fetch_excel,
+            "load_uploaded_dataset": _make_load_uploaded_dataset(chat_id),
         }
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
@@ -424,6 +697,9 @@ TOOLS = [
                 "Only public http/https URLs are allowed (internal/private addresses "
                 "are blocked); responses are capped at "
                 f"{MAX_FETCH_BYTES} bytes and {FETCH_TIMEOUT}s. "
+                "If the user has uploaded a dataset to this chat (a message will say so), "
+                "call load_uploaded_dataset() — no arguments — to get it as a DataFrame; "
+                "there is no way to point it at any other file. "
                 "Always print() what you need to see."
             ),
             "parameters": {
@@ -548,7 +824,7 @@ def solve(chat_id: int, question: str) -> str:
                     code = tc["function"]["arguments"]
                 log_event(event="tool_call", chat_id=chat_id, step=step, code=code[:4000])
                 tool_started = time.perf_counter()
-                output = run_python(code)
+                output = run_python(code, chat_id)
                 tool_latency = time.perf_counter() - tool_started
                 log_event(event="tool_result", chat_id=chat_id, step=step, output=output[:4000], latency_s=round(tool_latency, 4))
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": output})
@@ -605,15 +881,24 @@ def handle_update(upd):
     if not msg:
         return
 
-    text = msg.get("text") or msg.get("caption") or ""
     chat_id = msg["chat"]["id"]
+    document = msg.get("document")
+    text = msg.get("text") or msg.get("caption") or ""
 
-    if not text:
+    if not document and not text:
         return
 
     try:
         with _get_chat_lock(chat_id):
-            reply = solve(chat_id, text)
+            if document:
+                upload_reply = handle_document_upload(chat_id, document)
+                # If the upload came with a question (caption) or the message
+                # also has plain text, answer it now — the dataset's profile
+                # is already in this chat's history by this point. Otherwise
+                # just send the deterministic upload acknowledgment.
+                reply = solve(chat_id, text) if text else upload_reply
+            else:
+                reply = solve(chat_id, text)
     except Exception:
         print(traceback.format_exc())      # <-- ADD THIS
         log_event(event="agent_crash", chat_id=chat_id, error=traceback.format_exc())
@@ -646,13 +931,19 @@ def poll_loop():
 
 
 def keepwarm_loop():
-    """Ping our own public URL so a free host never spins down."""
+    """Ping our own public URL so a free host never spins down. Also sweeps
+    expired uploaded-dataset directories on the same cadence, so we don't
+    need a separate cleanup thread/scheduler."""
     while True:
         time.sleep(600)
         try:
             requests.get(f"{BASE_URL}/health", timeout=30)
         except Exception:
             pass
+        try:
+            _cleanup_expired_uploads()
+        except Exception as e:
+            log_event(event="upload_cleanup_error", error=str(e))
 
 
 # ---------------------------------------------------------------- web app
